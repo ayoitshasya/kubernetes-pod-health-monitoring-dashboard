@@ -5,8 +5,11 @@ Local run:  python k8s_backend.py
 Render:     gunicorn k8s_backend:app
 
 Environment variables:
-  KUBECONFIG_DATA  — base64-encoded kubeconfig (required on Render/GKE)
-  PORT             — port to listen on (Render sets this automatically)
+  KUBECONFIG_DATA   — base64-encoded kubeconfig (required on Render/GKE)
+  GCLOUD_PROJECT    — GCP project ID (for token refresh on Render)
+  GCLOUD_CLUSTER    — GKE cluster name (default: k8s-dashboard)
+  GCLOUD_REGION     — GKE cluster region (default: us-central1)
+  PORT              — port to listen on (Render sets this automatically)
 """
 
 from flask import Flask, jsonify
@@ -16,28 +19,95 @@ from kubernetes.client.exceptions import ApiException
 import base64
 import datetime
 import os
+import subprocess
 import sys
 import tempfile
-
-# Must be set before any kubernetes client calls — required for GKE auth
-os.environ["USE_GKE_GCLOUD_AUTH_PLUGIN"] = "True"
+import threading
+import time
+import yaml
 
 app = Flask(__name__)
-
-# Allow requests from any origin — covers both Render static site and local dev
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# ─────────────────────────────────────────────────────────────
+# Token refresh state
+# ─────────────────────────────────────────────────────────────
+_kubeconfig_path  = None   # path to decoded temp kubeconfig file
+_token_refreshed  = None   # datetime of last successful token refresh
+_refresh_lock     = threading.Lock()
+
+# GKE access tokens expire after 60 minutes — refresh every 45 min
+TOKEN_REFRESH_INTERVAL = 45 * 60
+
+
+# ─────────────────────────────────────────────────────────────
+# Token refresh — rewrites the token in the kubeconfig file
+# ─────────────────────────────────────────────────────────────
+def refresh_gke_token():
+    """
+    Fetch a fresh GKE access token using google-auth and rewrite
+    the token field in the kubeconfig temp file.
+    Called automatically every 45 minutes by a background thread.
+    Also called on 401 Unauthorized responses.
+    """
+    global _token_refreshed
+
+    if not os.environ.get("KUBECONFIG_DATA"):
+        return   # local mode — no token refresh needed
+
+    if _kubeconfig_path is None or not os.path.exists(_kubeconfig_path):
+        print("  [WARN] Token refresh skipped — kubeconfig not loaded yet")
+        return
+
+    try:
+        import google.auth
+        import google.auth.transport.requests
+
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        request = google.auth.transport.requests.Request()
+        credentials.refresh(request)
+        new_token = credentials.token
+
+        # Read current kubeconfig, update token, write back
+        with open(_kubeconfig_path, "r") as f:
+            kube_cfg = yaml.safe_load(f)
+
+        for user in kube_cfg.get("users", []):
+            if "user" in user:
+                user["user"]["token"] = new_token
+
+        with open(_kubeconfig_path, "w") as f:
+            yaml.dump(kube_cfg, f)
+
+        _token_refreshed = datetime.datetime.utcnow()
+        print(f"  [OK] Token refreshed at {_token_refreshed.strftime('%H:%M:%S UTC')}")
+
+    except Exception as e:
+        print(f"  [WARN] Token refresh failed: {e}")
+        print("  [WARN] Will retry on next refresh cycle")
+
+
+def token_refresh_loop():
+    """Background thread — refreshes the GKE token every 45 minutes."""
+    while True:
+        time.sleep(TOKEN_REFRESH_INTERVAL)
+        with _refresh_lock:
+            print("  [INFO] Background token refresh starting...")
+            refresh_gke_token()
+
 
 # ─────────────────────────────────────────────────────────────
 # Kubeconfig loader
 # ─────────────────────────────────────────────────────────────
-_kubeconfig_path = None
-
 def load_kube():
     """
     Load kubeconfig from:
     1. KUBECONFIG_DATA env var (base64) — Render/GKE
     2. ~/.kube/config — local development
-    Writes the decoded kubeconfig to a temp file once and reuses it.
+    Writes decoded kubeconfig to a temp file once and reuses it.
+    Token refresh updates the same file in place.
     """
     global _kubeconfig_path
 
@@ -59,13 +129,37 @@ def load_kube():
                 tmp.close()
                 _kubeconfig_path = tmp.name
                 print(f"  [OK] kubeconfig decoded → {_kubeconfig_path}")
+
+                # Do an immediate token refresh on first load
+                refresh_gke_token()
+
             except Exception as e:
                 print(f"  [ERROR] Failed to decode KUBECONFIG_DATA: {e}")
                 sys.exit(1)
+
         config.load_kube_config(config_file=_kubeconfig_path)
     else:
-        # Local — read from ~/.kube/config
         config.load_kube_config()
+
+
+# ─────────────────────────────────────────────────────────────
+# K8s API call wrapper — auto-retries on 401 with token refresh
+# ─────────────────────────────────────────────────────────────
+def k8s_call(fn, *args, **kwargs):
+    """
+    Call a kubernetes API function. If it returns 401 Unauthorized
+    (expired token), refresh the token and retry once.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except ApiException as e:
+        if e.status == 401:
+            print("  [WARN] 401 Unauthorized — refreshing token and retrying")
+            with _refresh_lock:
+                refresh_gke_token()
+            load_kube()
+            return fn(*args, **kwargs)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────
@@ -75,7 +169,7 @@ def verify_cluster():
     try:
         load_kube()
         v1 = client.CoreV1Api()
-        v1.list_namespace(_request_timeout=10)
+        k8s_call(v1.list_namespace, _request_timeout=10)
         print("  [OK] Cluster connection verified")
     except config.ConfigException as e:
         print(f"\n  [ERROR] kubeconfig error: {e}")
@@ -91,20 +185,21 @@ def verify_cluster():
 
 
 # ─────────────────────────────────────────────────────────────
-# Metrics fetcher — GKE has metrics built in, no addon needed
+# Metrics fetcher
 # ─────────────────────────────────────────────────────────────
 def get_metrics():
     metrics_map = {}
     try:
         custom = client.CustomObjectsApi()
-        pod_metrics = custom.list_cluster_custom_object(
+        pod_metrics = k8s_call(
+            custom.list_cluster_custom_object,
             group="metrics.k8s.io",
             version="v1beta1",
             plural="pods",
         )
 
         v1 = client.CoreV1Api()
-        nodes = v1.list_node()
+        nodes = k8s_call(v1.list_node)
         if not nodes.items:
             return metrics_map
 
@@ -173,7 +268,7 @@ def parse_mem(value):
 def get_pods():
     load_kube()
     v1 = client.CoreV1Api()
-    pod_list = v1.list_pod_for_all_namespaces(watch=False)
+    pod_list = k8s_call(v1.list_pod_for_all_namespaces, watch=False)
     metrics_map = get_metrics()
 
     pods = []
@@ -246,14 +341,38 @@ def api_health():
     try:
         load_kube()
         v1 = client.CoreV1Api()
-        v1.list_namespace(_request_timeout=5)
-        return jsonify({"status": "ok", "cluster": "reachable"})
+        k8s_call(v1.list_namespace, _request_timeout=5)
+
+        # Include token refresh status in health response
+        refresh_info = (
+            _token_refreshed.strftime("%H:%M:%S UTC")
+            if _token_refreshed else "not yet refreshed"
+        )
+        return jsonify({
+            "status":         "ok",
+            "cluster":        "reachable",
+            "token_refreshed": refresh_info,
+        })
     except Exception as e:
         return jsonify({
             "status":  "error",
             "cluster": "unreachable",
             "detail":  str(e)
         }), 503
+
+
+@app.route("/api/token/refresh")
+def api_token_refresh():
+    """Manual token refresh endpoint — call if dashboard shows auth errors."""
+    try:
+        with _refresh_lock:
+            refresh_gke_token()
+        return jsonify({
+            "status":  "ok",
+            "refreshed_at": _token_refreshed.strftime("%H:%M:%S UTC") if _token_refreshed else "unknown"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────
@@ -267,6 +386,12 @@ if __name__ == "__main__":
     print("╚══════════════════════════════════════════════╝")
 
     verify_cluster()
+
+    # Start background token refresh thread
+    if os.environ.get("KUBECONFIG_DATA"):
+        t = threading.Thread(target=token_refresh_loop, daemon=True)
+        t.start()
+        print(f"  [OK] Token auto-refresh started (every {TOKEN_REFRESH_INTERVAL//60} minutes)")
 
     port = int(os.environ.get("PORT", 5000))
     print(f"  Listening on port {port}")
