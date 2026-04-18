@@ -1,2 +1,25 @@
-setup_guide.docx
-demo_setup.bat
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Kubernetes — never commit kubeconfig
+.kube/
+kubeconfig.yaml
+kubeconfig
+*.kubeconfig
+
+# Secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/

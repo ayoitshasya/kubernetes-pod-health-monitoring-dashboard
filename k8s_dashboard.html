@@ -94,10 +94,6 @@
   </div>
 </div>
 
-<div class="mode-notice">
-  ℹ Running in <span>simulation mode</span> — no cluster required.
-  To connect Minikube: run <span>python k8s_backend.py</span> and set <span>const API_URL = 'http://localhost:5000/api/pods'</span> in the script below.
-</div>
 
 <div class="filter-row">
   <span class="filter-label">Namespace:</span>
@@ -123,7 +119,7 @@
 <script>
 // ─── CONFIG ───────────────────────────────────────────
 // Set this to your backend URL once k8s_backend.py is running:
-const API_URL = 'http://localhost:5000/api/pods';; // e.g. 'http://localhost:5000/api/pods'
+const API_URL = 'https://k8s-dashboard-backend.onrender.com/api/pods';
 const POLL_MS = 5000;
 
 // ─── SIMULATION DATA ──────────────────────────────────

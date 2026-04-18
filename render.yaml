@@ -1,0 +1,29 @@
+# render.yaml
+# Deploys both services from one GitHub repo.
+# Connect at: https://render.com → New → Blueprint
+
+services:
+
+  # ── Backend — Python Flask API ─────────────────────────────
+  - type: web
+    name: k8s-dashboard-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: oregon
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: KUBECONFIG_DATA
+        sync: false        # set manually in Render dashboard — paste base64 kubeconfig
+
+  # ── Frontend — Static HTML dashboard ───────────────────────
+  - type: web
+    name: k8s-dashboard
+    runtime: static
+    staticPublishPath: ./
+    region: oregon
+    plan: free
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /k8s_dashboard.html
