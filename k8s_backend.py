@@ -1,12 +1,11 @@
 """
 Kubernetes Pod Health Dashboard — Python Backend
-Requires: pip install kubernetes flask flask-cors gunicorn
 
 Local run:  python k8s_backend.py
-Render:     gunicorn k8s_backend:app  (set KUBECONFIG_DATA env var)
+Render:     gunicorn k8s_backend:app
 
 Environment variables:
-  KUBECONFIG_DATA  — base64-encoded kubeconfig (required on Render)
+  KUBECONFIG_DATA  — base64-encoded kubeconfig (required on Render/GKE)
   PORT             — port to listen on (Render sets this automatically)
 """
 
@@ -20,35 +19,37 @@ import os
 import sys
 import tempfile
 
-# Required for GKE authentication — must be set before any kubernetes calls
+# Must be set before any kubernetes client calls — required for GKE auth
 os.environ["USE_GKE_GCLOUD_AUTH_PLUGIN"] = "True"
 
 app = Flask(__name__)
-CORS(app)
+
+# Allow requests from any origin — covers both Render static site and local dev
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ─────────────────────────────────────────────────────────────
-# Kubeconfig loader — supports local file and Render env var
+# Kubeconfig loader
 # ─────────────────────────────────────────────────────────────
-_kubeconfig_path = None   # cached temp file path (Render only)
+_kubeconfig_path = None
 
 def load_kube():
     """
-    Load Kubernetes config from one of two sources:
-
-    1. KUBECONFIG_DATA env var (base64-encoded) — used on Render.
-       Decodes the kubeconfig and writes it to a temp file once,
-       then reuses that file on every subsequent call.
-
-    2. ~/.kube/config on disk — used for local development.
+    Load kubeconfig from:
+    1. KUBECONFIG_DATA env var (base64) — Render/GKE
+    2. ~/.kube/config — local development
+    Writes the decoded kubeconfig to a temp file once and reuses it.
     """
     global _kubeconfig_path
 
-    kube_data = os.environ.get("KUBECONFIG_DATA")
+    kube_data = os.environ.get("KUBECONFIG_DATA", "").strip()
 
     if kube_data:
-        # Render / cloud mode — decode base64 kubeconfig env var
         if _kubeconfig_path is None or not os.path.exists(_kubeconfig_path):
             try:
+                # Handle both padded and unpadded base64
+                padding = 4 - len(kube_data) % 4
+                if padding != 4:
+                    kube_data += "=" * padding
                 decoded = base64.b64decode(kube_data)
                 tmp = tempfile.NamedTemporaryFile(
                     delete=False, suffix=".yaml", mode="wb"
@@ -57,55 +58,42 @@ def load_kube():
                 tmp.flush()
                 tmp.close()
                 _kubeconfig_path = tmp.name
-                print(f"  [OK] kubeconfig written to temp file: {_kubeconfig_path}")
+                print(f"  [OK] kubeconfig decoded → {_kubeconfig_path}")
             except Exception as e:
                 print(f"  [ERROR] Failed to decode KUBECONFIG_DATA: {e}")
                 sys.exit(1)
         config.load_kube_config(config_file=_kubeconfig_path)
     else:
-        # Local mode — read from ~/.kube/config
+        # Local — read from ~/.kube/config
         config.load_kube_config()
 
 
 # ─────────────────────────────────────────────────────────────
-# Startup check — verify cluster is reachable before serving
+# Startup check
 # ─────────────────────────────────────────────────────────────
 def verify_cluster():
     try:
         load_kube()
         v1 = client.CoreV1Api()
-        v1.list_namespace(_request_timeout=5)
+        v1.list_namespace(_request_timeout=10)
         print("  [OK] Cluster connection verified")
     except config.ConfigException as e:
-        print("\n  [ERROR] Could not load kubeconfig.")
-        if os.environ.get("KUBECONFIG_DATA"):
-            print("  Check that KUBECONFIG_DATA is set correctly on Render.")
-        else:
-            print("  Local: run  minikube start --driver=docker")
-        print(f"\n  Detail: {e}")
+        print(f"\n  [ERROR] kubeconfig error: {e}")
+        print("  Render: check KUBECONFIG_DATA is set correctly")
+        print("  Local:  run minikube start --driver=docker")
         sys.exit(1)
     except ApiException as e:
-        print(f"\n  [ERROR] Kubernetes API error: {e}")
+        print(f"\n  [ERROR] Kubernetes API error ({e.status}): {e.reason}")
         sys.exit(1)
     except Exception as e:
-        print(f"\n  [ERROR] Cannot reach the cluster: {e}")
-        if not os.environ.get("KUBECONFIG_DATA"):
-            print("  Local: minikube start --driver=docker")
-            print("  Render: verify KUBECONFIG_DATA env var is set")
+        print(f"\n  [ERROR] Cannot reach cluster: {e}")
         sys.exit(1)
 
 
 # ─────────────────────────────────────────────────────────────
-# Metrics fetcher
+# Metrics fetcher — GKE has metrics built in, no addon needed
 # ─────────────────────────────────────────────────────────────
 def get_metrics():
-    """
-    Fetch CPU and memory from the metrics-server API.
-    Returns dict keyed by "namespace/pod-name" →
-        { "cpu_percent": int, "mem_mib": float }
-    Falls back to empty dict if metrics-server is unavailable.
-    GKE has metrics-server built in — no addon needed.
-    """
     metrics_map = {}
     try:
         custom = client.CustomObjectsApi()
@@ -120,9 +108,14 @@ def get_metrics():
         if not nodes.items:
             return metrics_map
 
-        # Sum all node capacity (GKE may have multiple nodes)
-        total_cpu_m = sum(parse_cpu(n.status.allocatable.get("cpu", "0")) for n in nodes.items)
-        total_mem_b = sum(parse_mem(n.status.allocatable.get("memory", "0")) for n in nodes.items)
+        total_cpu_m = sum(
+            parse_cpu(n.status.allocatable.get("cpu", "0"))
+            for n in nodes.items
+        )
+        total_mem_b = sum(
+            parse_mem(n.status.allocatable.get("memory", "0"))
+            for n in nodes.items
+        )
 
         for item in pod_metrics.get("items", []):
             ns       = item["metadata"]["namespace"]
@@ -145,7 +138,7 @@ def get_metrics():
 
     except ApiException as e:
         if e.status == 404:
-            print("  [WARN] metrics-server not available")
+            print("  [WARN] metrics API not available yet")
         else:
             print(f"  [WARN] Metrics API error ({e.status}): {e.reason}")
     except Exception as e:
@@ -156,8 +149,8 @@ def get_metrics():
 
 def parse_cpu(value):
     value = str(value).strip()
-    if value.endswith("m"):  return float(value[:-1])
-    if value.endswith("n"):  return float(value[:-1]) / 1e6
+    if value.endswith("m"): return float(value[:-1])
+    if value.endswith("n"): return float(value[:-1]) / 1e6
     try: return float(value) * 1000
     except ValueError: return 0.0
 
@@ -230,11 +223,19 @@ def api_pods():
     running  = sum(1 for p in pods if p["status"] == "Running")
     crashing = sum(1 for p in pods if p["status"] == "CrashLoopBackOff")
     pending  = sum(1 for p in pods if p["status"] == "Pending")
-    alerts   = [p for p in pods if p["status"] in ("CrashLoopBackOff", "Pending") or p["restarts"] >= 5]
+    alerts   = [
+        p for p in pods
+        if p["status"] in ("CrashLoopBackOff", "Pending") or p["restarts"] >= 5
+    ]
 
     return jsonify({
         "pods":    pods,
-        "summary": {"total": len(pods), "running": running, "crashing": crashing, "pending": pending},
+        "summary": {
+            "total":    len(pods),
+            "running":  running,
+            "crashing": crashing,
+            "pending":  pending,
+        },
         "alerts":    alerts,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     })
@@ -245,27 +246,28 @@ def api_health():
     try:
         load_kube()
         v1 = client.CoreV1Api()
-        v1.list_namespace(_request_timeout=3)
+        v1.list_namespace(_request_timeout=5)
         return jsonify({"status": "ok", "cluster": "reachable"})
     except Exception as e:
-        return jsonify({"status": "error", "cluster": "unreachable", "detail": str(e)}), 503
+        return jsonify({
+            "status":  "error",
+            "cluster": "unreachable",
+            "detail":  str(e)
+        }), 503
 
 
 # ─────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    mode = "RENDER (cloud)" if os.environ.get("KUBECONFIG_DATA") else "LOCAL"
+    mode = "RENDER/GKE" if os.environ.get("KUBECONFIG_DATA") else "LOCAL"
     print("╔══════════════════════════════════════════════╗")
-    print(f"║  K8s Pod Health Dashboard — {mode:<16} ║")
+    print(f"║  K8s Pod Health Dashboard  [{mode}]")
     print("║  Verifying cluster connection...             ║")
     print("╚══════════════════════════════════════════════╝")
 
     verify_cluster()
 
     port = int(os.environ.get("PORT", 5000))
-    print("╔══════════════════════════════════════════════╗")
-    print(f"║  Listening on port {port:<26} ║")
-    print("╚══════════════════════════════════════════════╝")
-
+    print(f"  Listening on port {port}")
     app.run(debug=False, host="0.0.0.0", port=port)
