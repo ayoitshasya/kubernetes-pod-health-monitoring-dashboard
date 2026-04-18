@@ -20,6 +20,9 @@ import os
 import sys
 import tempfile
 
+# Required for GKE authentication — must be set before any kubernetes calls
+os.environ["USE_GKE_GCLOUD_AUTH_PLUGIN"] = "True"
+
 app = Flask(__name__)
 CORS(app)
 
