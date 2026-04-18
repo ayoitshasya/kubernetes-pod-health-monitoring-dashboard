@@ -9,6 +9,7 @@ services:
     name: k8s-dashboard-backend
     runtime: docker
     dockerfilePath: ./Dockerfile
+    region: oregon
     plan: free
     healthCheckPath: /api/health
     envVars:
@@ -20,7 +21,6 @@ services:
     name: k8s-dashboard
     runtime: static
     staticPublishPath: ./
-    plan: free
     routes:
       - type: rewrite
         source: /*
