@@ -262,6 +262,20 @@ def parse_mem(value):
     except ValueError: return 0.0
 
 
+# Namespaces to exclude — GKE system namespaces not relevant to user workloads
+SYSTEM_NAMESPACES = {
+    "kube-system",
+    "kube-public",
+    "kube-node-lease",
+    "gke-system",
+    "gke-managed-system",
+    "gmp-system",
+    "gmp-public",
+    "cert-manager",
+    "config-management-system",
+    "config-management-monitoring",
+}
+
 # ─────────────────────────────────────────────────────────────
 # Pod reader
 # ─────────────────────────────────────────────────────────────
@@ -273,6 +287,9 @@ def get_pods():
 
     pods = []
     for p in pod_list.items:
+        # Skip GKE system pods — only show user workloads
+        if p.metadata.namespace in SYSTEM_NAMESPACES:
+            continue
         container_statuses = p.status.container_statuses or []
         restarts = sum(cs.restart_count for cs in container_statuses)
         phase    = p.status.phase or "Unknown"
