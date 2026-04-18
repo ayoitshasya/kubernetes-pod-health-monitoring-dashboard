@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Kubernetes Pod Health Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  :root{
+    --bg:#111;--card:#1a1a1a;--card-border:#2a2a2a;
+    --text:#e8e8e8;--dim:#888;--dimmer:#555;
+    --green:#4caf7d;--red:#e05252;--yellow:#d4943a;--blue:#7ab4f5;
+    --green-bg:rgba(76,175,125,0.15);--red-bg:rgba(224,82,82,0.15);--yellow-bg:rgba(212,148,58,0.15);
+    --crash-border:rgba(224,82,82,0.6);--bar-track:#2d2d2d;
+  }
+  body{
+    background:var(--bg);color:var(--text);
+    font-family:'JetBrains Mono',monospace;font-size:13px;
+    min-height:100vh;padding:24px 32px;
+  }
+  /* TOP BAR */
+  .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;}
+  .topbar h1{font-size:18px;font-weight:700;color:#fff;letter-spacing:-0.02em;}
+  .topbar-right{display:flex;align-items:center;gap:16px;}
+  .ns-badge{border:1px solid var(--blue);border-radius:20px;padding:5px 14px;font-size:12px;color:var(--blue);}
+  .last-refresh{font-size:12px;color:var(--dim);}
+  .live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:blink 2s infinite;display:inline-block;margin-right:6px;}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
+  /* SUMMARY */
+  .summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px;}
+  .stat{background:var(--card);border:1px solid var(--card-border);border-radius:10px;padding:16px 20px;}
+  .stat-label{font-size:12px;color:var(--dim);margin-bottom:6px;}
+  .stat-value{font-size:36px;font-weight:700;line-height:1;}
+  .stat-value.white{color:#fff;} .stat-value.green{color:var(--green);} .stat-value.red{color:var(--red);} .stat-value.yellow{color:var(--yellow);}
+  /* FILTER */
+  .filter-row{display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap;}
+  .filter-label{font-size:11px;color:var(--dim);}
+  .ns-btn{background:#222;border:1px solid #333;border-radius:6px;padding:4px 12px;font-size:11px;color:var(--dim);cursor:pointer;font-family:inherit;transition:all 0.2s;}
+  .ns-btn:hover,.ns-btn.active{border-color:var(--blue);color:var(--blue);background:#111d2e;}
+  .search-box{background:#1a1a1a;border:1px solid #333;border-radius:6px;padding:4px 12px;font-size:11px;color:var(--text);font-family:inherit;outline:none;width:180px;}
+  .search-box:focus{border-color:var(--blue);}
+  .refresh-btn{margin-left:auto;background:#1a1a1a;border:1px solid #333;border-radius:6px;padding:5px 14px;font-size:11px;color:var(--dim);cursor:pointer;font-family:inherit;transition:all 0.2s;display:flex;align-items:center;gap:6px;}
+  .refresh-btn:hover{border-color:var(--green);color:var(--green);}
+  .spinner{width:10px;height:10px;border:1.5px solid #333;border-top-color:var(--blue);border-radius:50%;animation:spin 0.8s linear infinite;display:none;}
+  .spinner.active{display:block;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  /* MODE NOTICE */
+  .mode-notice{background:#111d2e;border:1px solid rgba(122,180,245,0.25);border-radius:6px;padding:8px 14px;font-size:11px;color:var(--dim);margin-bottom:18px;}
+  .mode-notice span{color:var(--blue);}
+  /* POD GRID */
+  .pod-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px;}
+  .pod-card{background:var(--card);border:1px solid var(--card-border);border-radius:10px;padding:16px 18px;}
+  .pod-card.crash{border-color:var(--crash-border);background:#1c1212;}
+  .pod-card.crash-glow{animation:card-pulse 1.5s infinite;}
+  @keyframes card-pulse{0%,100%{border-color:rgba(224,82,82,0.6)}50%{border-color:rgba(224,82,82,1)}}
+  .pod-card.pending{border-color:rgba(212,148,58,0.4);background:#1a1710;}
+  .pod-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;}
+  .pod-name{font-size:13px;font-weight:700;color:#fff;}
+  .badge{border-radius:6px;padding:3px 10px;font-size:11px;font-weight:600;}
+  .badge.running{background:var(--green-bg);color:var(--green);border:1px solid rgba(76,175,125,0.3);}
+  .badge.crash{background:var(--red-bg);color:var(--red);border:1px solid rgba(224,82,82,0.4);}
+  .badge.pending{background:var(--yellow-bg);color:var(--yellow);border:1px solid rgba(212,148,58,0.3);}
+  .pod-meta{font-size:11px;color:var(--dim);margin-bottom:12px;}
+  .restarts-high{color:var(--red);font-weight:700;}
+  .metric-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+  .metric-label{font-size:11px;color:var(--dim);width:32px;flex-shrink:0;}
+  .bar-track{flex:1;height:6px;background:var(--bar-track);border-radius:3px;overflow:hidden;}
+  .bar-fill{height:100%;border-radius:3px;transition:width 1s ease;}
+  .bar-green{background:var(--green);} .bar-red{background:var(--red);} .bar-yellow{background:var(--yellow);}
+  .metric-pct{font-size:11px;color:var(--dim);width:36px;text-align:right;}
+  /* ALERTS */
+  .alerts-panel{background:var(--card);border:1px solid var(--crash-border);border-radius:10px;padding:16px 20px;}
+  .alerts-title{color:var(--red);font-size:13px;font-weight:700;margin-bottom:14px;}
+  .alert-item{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:9px 0;border-bottom:1px solid #222;}
+  .alert-item:last-child{border-bottom:none;padding-bottom:0;}
+  .alert-left{display:flex;align-items:flex-start;gap:10px;}
+  .alert-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;margin-top:3px;}
+  .alert-dot.red{background:var(--red);box-shadow:0 0 6px rgba(224,82,82,0.6);}
+  .alert-dot.yellow{background:var(--yellow);box-shadow:0 0 6px rgba(212,148,58,0.5);}
+  .alert-msg{font-size:12px;color:var(--text);line-height:1.4;}
+  .alert-time{font-size:11px;color:var(--dim);flex-shrink:0;white-space:nowrap;}
+  .no-alerts{font-size:12px;color:var(--dim);padding:8px 0;}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>Kubernetes pod health dashboard</h1>
+  <div class="topbar-right">
+    <div class="ns-badge" id="ns-label">namespace: all</div>
+    <div class="last-refresh"><span class="live-dot"></span><span id="refresh-time">fetching…</span></div>
+  </div>
+</div>
+
+<div class="mode-notice">
+  ℹ Running in <span>simulation mode</span> — no cluster required.
+  To connect Minikube: run <span>python k8s_backend.py</span> and set <span>const API_URL = 'http://localhost:5000/api/pods'</span> in the script below.
+</div>
+
+<div class="filter-row">
+  <span class="filter-label">Namespace:</span>
+  <button class="ns-btn active" onclick="setNs('all',this)">all</button>
+  <button class="ns-btn" onclick="setNs('default',this)">default</button>
+  <button class="ns-btn" onclick="setNs('monitoring',this)">monitoring</button>
+  <button class="ns-btn" onclick="setNs('ingress',this)">ingress</button>
+  <button class="ns-btn" onclick="setNs('logging',this)">logging</button>
+  <input class="search-box" id="search" placeholder="search pods…" oninput="render()"/>
+  <button class="refresh-btn" onclick="fetchData()">
+    <div class="spinner" id="spinner"></div>
+    ↻ Refresh
+  </button>
+</div>
+
+<div class="summary" id="summary"></div>
+<div class="pod-grid" id="pod-grid"></div>
+<div class="alerts-panel" id="alerts-panel" style="display:none">
+  <div class="alerts-title">⚠ Active alerts</div>
+  <div id="alerts-list"></div>
+</div>
+
+<script>
+// ─── CONFIG ───────────────────────────────────────────
+// Set this to your backend URL once k8s_backend.py is running:
+const API_URL = 'http://localhost:5000/api/pods';; // e.g. 'http://localhost:5000/api/pods'
+const POLL_MS = 5000;
+
+// ─── SIMULATION DATA ──────────────────────────────────
+const BASE = [
+  {name:'api-server-7f9b',    ns:'default',    status:'Running',          restarts:0,  cpu:42, mem:61, age:'3d 4h'},
+  {name:'worker-pod-3c2a',    ns:'default',    status:'CrashLoopBackOff', restarts:14, cpu:88, mem:95, age:'22m'},
+  {name:'db-replica-1a4f',    ns:'default',    status:'Running',          restarts:1,  cpu:29, mem:48, age:'1d 12h'},
+  {name:'cache-svc-9d1e',     ns:'default',    status:'Running',          restarts:0,  cpu:18, mem:33, age:'5d 2h'},
+  {name:'queue-consumer-b2f1',ns:'default',    status:'CrashLoopBackOff', restarts:7,  cpu:72, mem:80, age:'55m'},
+  {name:'frontend-pod-5e8c',  ns:'default',    status:'Pending',          restarts:0,  cpu:0,  mem:0,  age:'3m'},
+  {name:'metrics-agent-k8p1', ns:'monitoring', status:'Running',          restarts:0,  cpu:11, mem:22, age:'8h'},
+  {name:'ingress-ctrl-3xz2',  ns:'ingress',    status:'Running',          restarts:0,  cpu:9,  mem:17, age:'2d'},
+  {name:'log-shipper-w9q4',   ns:'logging',    status:'Running',          restarts:0,  cpu:6,  mem:14, age:'14h'},
+  {name:'auth-svc-5m7n',      ns:'default',    status:'Running',          restarts:3,  cpu:37, mem:52, age:'4h'},
+];
+
+let simState = BASE.map(p=>({...p}));
+let tick = 0;
+
+function clamp(v,lo,hi){return Math.max(lo,Math.min(hi,v));}
+function drift(v,d){return clamp(v+Math.floor((Math.random()-0.5)*2*d),1,99);}
+
+function getSimData(){
+  tick++;
+  simState = simState.map(p=>{
+    const s={...p};
+    if(s.status==='Running'){s.cpu=drift(s.cpu,8);s.mem=drift(s.mem,5);}
+    if(s.status==='CrashLoopBackOff'&&tick%6===0)s.restarts++;
+    return s;
+  });
+  const running =simState.filter(p=>p.status==='Running').length;
+  const crashing=simState.filter(p=>p.status==='CrashLoopBackOff').length;
+  const pending =simState.filter(p=>p.status==='Pending').length;
+  const alerts  =simState.filter(p=>p.status!=='Running'||p.restarts>=5);
+  return{pods:simState,summary:{total:simState.length,running,crashing,pending},alerts};
+}
+
+// ─── STATE ────────────────────────────────────────────
+let data=null, nsFilter='all', lastFetch=null;
+
+// ─── FETCH ────────────────────────────────────────────
+async function fetchData(){
+  document.getElementById('spinner').classList.add('active');
+  try{
+    if(API_URL){
+      const r=await fetch(API_URL);data=await r.json();
+    }else{
+      await new Promise(r=>setTimeout(r,250));
+      data=getSimData();
+    }
+    lastFetch=new Date();
+  }catch(e){data=getSimData();lastFetch=new Date();}
+  document.getElementById('spinner').classList.remove('active');
+  render();
+}
+
+function setNs(ns,btn){
+  nsFilter=ns;
+  document.querySelectorAll('.ns-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('ns-label').textContent='namespace: '+ns;
+  render();
+}
+
+function filteredPods(){
+  if(!data)return[];
+  const q=document.getElementById('search').value.toLowerCase();
+  return data.pods.filter(p=>{
+    if(nsFilter!=='all'&&p.namespace!==nsFilter)return false;
+    if(q&&!p.name.includes(q)&&!p.namespace.includes(q))return false;
+    return true;
+  });
+}
+
+// ─── RENDER ───────────────────────────────────────────
+function render(){
+  if(!data)return;
+  renderSummary();renderGrid();renderAlerts();updateTime();
+}
+
+function renderSummary(){
+  const s=data.summary;
+  document.getElementById('summary').innerHTML=`
+    <div class="stat"><div class="stat-label">Total pods</div><div class="stat-value white">${s.total}</div></div>
+    <div class="stat"><div class="stat-label">Running</div><div class="stat-value green">${s.running}</div></div>
+    <div class="stat"><div class="stat-label">Failing</div><div class="stat-value red">${s.crashing}</div></div>
+    <div class="stat"><div class="stat-label">Pending</div><div class="stat-value yellow">${s.pending}</div></div>`;
+}
+
+function barColor(pct){return pct>=85?'bar-red':pct>=65?'bar-yellow':'bar-green';}
+
+function renderGrid(){
+  const pods=filteredPods();
+  if(!pods.length){
+    document.getElementById('pod-grid').innerHTML='<div style="color:var(--dim);padding:20px;grid-column:1/-1">No pods match the current filter.</div>';
+    return;
+  }
+  document.getElementById('pod-grid').innerHTML=pods.map(p=>{
+    const isCrash=p.status==='CrashLoopBackOff';
+    const isPending=p.status==='Pending';
+    const cardCls=isCrash?'pod-card crash crash-glow':isPending?'pod-card pending':'pod-card';
+    const bdgCls=isCrash?'badge crash':isPending?'badge pending':'badge running';
+    const bdgTxt=isCrash?'CrashLoop':p.status;
+    const restHtml=p.restarts>=5?`<span class="restarts-high">${p.restarts}</span>`:p.restarts;
+    const cpuBar=isPending?`<div class="bar-fill bar-green" style="width:0%"></div>`
+                          :`<div class="bar-fill ${barColor(p.cpu)}" style="width:${p.cpu}%"></div>`;
+    const memBar=isPending?`<div class="bar-fill bar-green" style="width:0%"></div>`
+                          :`<div class="bar-fill ${barColor(Math.round(p.memory/2.56))}" style="width:${Math.min(100,Math.round(p.memory/2.56))}%"></div>`;
+    const cpuVal=isPending?'—':p.cpu+'%';
+    const memVal=isPending?'—':(p.memory!=null&&p.memory!==undefined?p.memory+'Mi':'0Mi');
+    return`<div class="${cardCls}">
+      <div class="pod-card-header">
+        <div class="pod-name">${p.name}</div>
+        <div class="${bdgCls}">${bdgTxt}</div>
+      </div>
+      <div class="pod-meta">Restarts: ${restHtml} &nbsp;|&nbsp; Age: ${p.age||'—'}</div>
+      <div class="metric-row"><div class="metric-label">CPU</div><div class="bar-track">${cpuBar}</div><div class="metric-pct">${cpuVal}</div></div>
+      <div class="metric-row"><div class="metric-label">Mem</div><div class="bar-track">${memBar}</div><div class="metric-pct">${memVal}</div></div>
+    </div>`;
+  }).join('');
+}
+
+function renderAlerts(){
+  const panel=document.getElementById('alerts-panel');
+  const list=document.getElementById('alerts-list');
+  const alerts=data.alerts||[];
+  if(!alerts.length){panel.style.display='none';return;}
+  panel.style.display='block';
+  list.innerHTML=alerts.map(p=>{
+    const isCrash=p.status==='CrashLoopBackOff';
+    const dotCls=isCrash?'red':'yellow';
+    let msg=isCrash
+      ?`${p.name} — CrashLoopBackOff (${p.restarts} restarts).${p.memory>=230?' OOMKilled suspected.':' Check logs.'}`
+      :p.status==='Pending'
+      ?`${p.name} — Stuck in Pending. Insufficient node resources.`
+      :`${p.name} — Elevated restart count (${p.restarts}). Monitor closely.`;
+    return`<div class="alert-item">
+      <div class="alert-left"><div class="alert-dot ${dotCls}"></div><div class="alert-msg">${msg}</div></div>
+      <div class="alert-time">${p.age||'—'}</div>
+    </div>`;
+  }).join('');
+}
+
+function updateTime(){
+  if(!lastFetch)return;
+  const s=Math.round((Date.now()-lastFetch.getTime())/1000);
+  document.getElementById('refresh-time').textContent='Last refresh: '+(s<3?'just now':s+'s ago');
+}
+
+fetchData();
+setInterval(fetchData,POLL_MS);
+setInterval(updateTime,1000);
+</script>
+</body>
+</html>
